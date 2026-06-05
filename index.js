@@ -7,7 +7,6 @@ const http = require("http");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ARRAY DIRECTO
 let radiosData = [];
 
 try {
@@ -16,74 +15,82 @@ try {
     radiosData = JSON.parse(raw);
     console.log("JSON cargado correctamente");
 } catch (err) {
-    console.error("Error leyendo radio.json");
-    console.error(err);
+    console.error("Error leyendo radio.json:", err.message);
 }
 
-// ======================================
 // ROOT
-// ======================================
 app.get("/", (req, res) => {
-    res.json({
-        status: "online"
-    });
+    res.json({ status: "online" });
 });
 
-// ======================================
 // LISTA RADIOS
-// ======================================
 app.get("/radio", (req, res) => {
     res.json(radiosData);
 });
 
-// ======================================
-// STREAM RADIO (OPTIMIZADO)
-// ======================================
+// STREAM RADIO (CON REDIRECCIONES Y PROTECCIÓN DE ERRORES)
 app.get("/radio/:id", (req, res) => {
     const id = parseInt(req.params.id);
     const radio = radiosData.find(r => r.id === id);
 
     if (!radio || !radio.url) {
-        return res.status(404).json({
-            error: "Radio no encontrada o sin URL válida"
-        });
+        return res.status(404).json({ error: "Radio no encontrada o sin URL válida" });
     }
 
-    const streamUrl = radio.url;
-    const client = streamUrl.startsWith("https") ? https : http;
+    let proxyReq = null;
 
-    // Guardamos la petición externa en una variable para poder controlarla
-    const proxyReq = client.get(streamUrl, (stream) => {
-        // Obtenemos el tipo de contenido original o forzamos audio/mpeg
-        const contentType = stream.headers["content-type"] || "audio/mpeg";
+    // Función interna para manejar la conexión (soporta redirecciones)
+    const connectToStream = (streamUrl) => {
+        const client = streamUrl.startsWith("https") ? https : http;
 
-        res.writeHead(200, {
-            "Content-Type": contentType,
-            "Access-Control-Allow-Origin": "*",
-            "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked"
+        proxyReq = client.get(streamUrl, (stream) => {
+            // 1. Manejo de Redirecciones (301, 302, 307, 308)
+            if ([301, 302, 307, 308].includes(stream.statusCode) && stream.headers.location) {
+                console.log(`Redirigiendo radio ID ${id} hacia: ${stream.headers.location}`);
+                return connectToStream(stream.headers.location); // Llamada recursiva
+            }
+
+            // 2. Si el origen responde con error HTTP (ej. 404 o 500)
+            if (stream.statusCode >= 400) {
+                if (!res.headersSent) {
+                    return res.status(stream.statusCode).json({ error: "La emisora origen devolvió un error" });
+                }
+            }
+
+            const contentType = stream.headers["content-type"] || "audio/mpeg";
+
+            res.writeHead(200, {
+                "Content-Type": contentType,
+                "Access-Control-Allow-Origin": "*",
+                "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked"
+            });
+
+            // Capturar errores en pleno streaming (durante la transmisión)
+            stream.on("error", (streamErr) => {
+                console.error(`Error en el flujo de datos de radio ID ${id}:`, streamErr.message);
+                res.end(); // Cierra la conexión de forma segura con el cliente
+            });
+
+            stream.pipe(res);
         });
 
-        // Transmitimos el audio directamente al usuario
-        stream.pipe(res);
-    });
+        // Error al conectar inicialmente
+        proxyReq.on("error", (err) => {
+            console.error(`Error de conexión inicial en radio ID ${id}:`, err.message);
+            if (!res.headersSent) {
+                res.status(500).json({ error: "Error conectando con la emisora origen" });
+            }
+        });
+    };
 
-    // CONTROL DE ERRORES: Si la emisora original falla o se cae
-    proxyReq.on("error", (err) => {
-        console.error(`Error en streaming de radio ID ${id}:`, err.message);
-        
-        // Solo respondemos error si no hemos enviado los encabezados de audio aún
-        if (!res.headersSent) {
-            res.status(500).json({
-                error: "Error conectando con la emisora origen"
-            });
-        }
-    });
+    // Iniciar la conexión por primera vez
+    connectToStream(radio.url);
 
-    // OPTIMIZACIÓN CLAVE: Si el oyente cierra el reproductor, la web o la app
+    // Si el oyente cierra la app o web
     req.on("close", () => {
-        console.log(`Cliente desconectado de la radio ID ${id}. Cerrando conexión origen.`);
-        proxyReq.destroy(); // Corta la descarga de datos desde la emisora
+        console.log(`Cliente desconectado de la radio ID ${id}.`);
+        if (proxyReq) proxyReq.destroy(); 
     });
 });
 
