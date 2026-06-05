@@ -2,7 +2,7 @@
 {
   "name": "play-store",
   "version": "1.0.0",
-  "description": "Backend mínimo para MyRadio con La Fronterisima",
+  "description": "Backend Radio Digital",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
