@@ -28,7 +28,7 @@ app.get("/radio", (req, res) => {
     res.json(radiosData);
 });
 
-// STREAM RADIO (CON REDIRECCIONES Y PROTECCIÓN DE ERRORES)
+// STREAM RADIO (SEGURO CONTRA FUGAS Y REDIRECCIONES)
 app.get("/radio/:id", (req, res) => {
     const id = parseInt(req.params.id);
     const radio = radiosData.find(r => r.id === id);
@@ -37,24 +37,53 @@ app.get("/radio/:id", (req, res) => {
         return res.status(404).json({ error: "Radio no encontrada o sin URL válida" });
     }
 
-    let proxyReq = null;
+    // Almacena las peticiones activas para este cliente específico
+    let activeRequests = new Set();
+    let isClientConnected = true;
 
-    // Función interna para manejar la conexión (soporta redirecciones)
-    const connectToStream = (streamUrl) => {
+    // Función interna recursiva con contador de saltos
+    const connectToStream = (streamUrl, redirectCount = 0) => {
+        // Evitar bucles infinitos de redirección
+        if (redirectCount > 5) {
+            console.error(`Radio ID ${id} superó el límite de redirecciones.`);
+            if (!res.headersSent) {
+                res.status(502).json({ error: "Demasiadas redirecciones en la emisora origen" });
+            }
+            return;
+        }
+
+        // Si el cliente se desconectó mientras procesábamos esto, abortamos inmediatamente
+        if (!isClientConnected) return;
+
         const client = streamUrl.startsWith("https") ? https : http;
 
-        proxyReq = client.get(streamUrl, (stream) => {
-            // 1. Manejo de Redirecciones (301, 302, 307, 308)
+        const proxyReq = client.get(streamUrl, (stream) => {
+            // Remover la petición actual del Set ya que ha respondido
+            activeRequests.delete(proxyReq);
+
+            // 1. Manejo de Redirecciones de forma segura
             if ([301, 302, 307, 308].includes(stream.statusCode) && stream.headers.location) {
-                console.log(`Redirigiendo radio ID ${id} hacia: ${stream.headers.location}`);
-                return connectToStream(stream.headers.location); // Llamada recursiva
+                console.log(`Redirigiendo radio ID ${id} [Salto ${redirectCount + 1}] hacia: ${stream.headers.location}`);
+                
+                // Es vital reanudar o destruir el stream viejo para liberar memoria
+                stream.resume(); 
+                
+                return connectToStream(stream.headers.location, redirectCount + 1);
             }
 
-            // 2. Si el origen responde con error HTTP (ej. 404 o 500)
+            // 2. Si el origen responde con error HTTP
             if (stream.statusCode >= 400) {
+                stream.resume();
                 if (!res.headersSent) {
                     return res.status(stream.statusCode).json({ error: "La emisora origen devolvió un error" });
                 }
+                return;
+            }
+
+            // Si el cliente se desconectó justo en el milisegundo en que el stream abrió
+            if (!isClientConnected) {
+                stream.destroy();
+                return;
             }
 
             const contentType = stream.headers["content-type"] || "audio/mpeg";
@@ -66,17 +95,21 @@ app.get("/radio/:id", (req, res) => {
                 "Transfer-Encoding": "chunked"
             });
 
-            // Capturar errores en pleno streaming (durante la transmisión)
+            // Capturar errores durante la transmisión activa
             stream.on("error", (streamErr) => {
                 console.error(`Error en el flujo de datos de radio ID ${id}:`, streamErr.message);
-                res.end(); // Cierra la conexión de forma segura con el cliente
+                res.end();
             });
 
             stream.pipe(res);
         });
 
-        // Error al conectar inicialmente
+        // Registrar la petición activa en nuestro set de control
+        activeRequests.add(proxyReq);
+
+        // Capturar errores de conexión iniciales
         proxyReq.on("error", (err) => {
+            activeRequests.delete(proxyReq);
             console.error(`Error de conexión inicial en radio ID ${id}:`, err.message);
             if (!res.headersSent) {
                 res.status(500).json({ error: "Error conectando con la emisora origen" });
@@ -84,13 +117,19 @@ app.get("/radio/:id", (req, res) => {
         });
     };
 
-    // Iniciar la conexión por primera vez
+    // Iniciar el flujo
     connectToStream(radio.url);
 
-    // Si el oyente cierra la app o web
+    // CONTROL DE DESCONEXIÓN ABSOLUTO
     req.on("close", () => {
-        console.log(`Cliente desconectado de la radio ID ${id}.`);
-        if (proxyReq) proxyReq.destroy(); 
+        isClientConnected = false;
+        console.log(`Cliente desconectado de la radio ID ${id}. Limpiando recursos...`);
+        
+        // Destruimos absolutamente todas las peticiones HTTP pendientes de este hilo
+        for (const activeReq of activeRequests) {
+            activeReq.destroy();
+        }
+        activeRequests.clear();
     });
 });
 
