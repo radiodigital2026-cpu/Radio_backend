@@ -14,7 +14,7 @@ let radiosData = [];
 try {
 
     const jsonPath =
-        path.join(__dirname, "radios.json");
+        path.join(__dirname, "radio.json");
 
     const raw =
         fs.readFileSync(jsonPath, "utf8");
@@ -25,7 +25,7 @@ try {
 
 } catch (err) {
 
-    console.error("Error leyendo radios.json");
+    console.error("Error leyendo radio.json");
 
     console.error(err);
 }
@@ -44,7 +44,7 @@ app.get("/", (req, res) => {
 // ======================================
 // LISTA RADIOS
 // ======================================
-app.get("/radios", (req, res) => {
+app.get("/radio", (req, res) => {
 
     res.json(radiosData);
 
